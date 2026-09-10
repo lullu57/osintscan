@@ -218,12 +218,31 @@ func collectDNSRecords(ctx context.Context, client *dnsx.DNSX, domain string, qu
 }
 
 func queryDNSAnswers(ctx context.Context, client *dnsx.DNSX, domain string, questionType uint16, queryTimeout time.Duration, resolverAttempts int) ([]dns.RR, error) {
-	client.Options.QuestionTypes = []uint16{questionType}
+	// A timed-out dnsx call cannot be canceled while it is blocked in the
+	// underlying resolver. Give each record type its own client so that a call
+	// finishing after its deadline cannot race with or inherit the next type's
+	// QuestionTypes value.
+	options := *client.Options
+	options.QuestionTypes = []uint16{questionType}
+	queryClient, err := dnsx.New(options)
+	if err != nil {
+		return nil, err
+	}
+
+	queryCtx := ctx
+	cancel := func() {}
+	if queryTimeout > 0 {
+		queryCtx, cancel = context.WithTimeout(ctx, queryTimeout)
+	}
+	defer cancel()
 
 	query := func() ([]dns.RR, error) {
 		var lastErr error
 		for attempt := 0; attempt < resolverAttempts; attempt++ {
-			results, err := client.QueryOne(domain)
+			if err := queryCtx.Err(); err != nil {
+				return nil, err
+			}
+			results, err := queryClient.QueryOne(domain)
 			if err != nil {
 				lastErr = err
 				continue
@@ -244,8 +263,6 @@ func queryDNSAnswers(ctx context.Context, client *dnsx.DNSX, domain string, ques
 		return query()
 	}
 
-	queryCtx, cancel := context.WithTimeout(ctx, queryTimeout)
-	defer cancel()
 	type queryResult struct {
 		answers []dns.RR
 		err     error

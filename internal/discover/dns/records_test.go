@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/miekg/dns"
 	"github.com/projectdiscovery/dnsx/libs/dnsx"
@@ -183,6 +184,61 @@ func TestGetDNSRecordsKeepsRecordsAndContinuesAfterTypeTimeout(t *testing.T) {
 	}
 	if len(records) != 2 || records[0].Value != "192.0.2.25" || records[1].Value != `"after-timeout"` {
 		t.Fatalf("expected records before and after the MX timeout, got %v", records)
+	}
+}
+
+func TestCollectDNSRecordsStopsTimedOutClientBeforeNextType(t *testing.T) {
+	var mxQueries atomic.Int32
+	var txtQueries atomic.Int32
+	resolver := startDNSTestServer(t, dns.HandlerFunc(func(writer dns.ResponseWriter, request *dns.Msg) {
+		question := request.Question[0]
+		response := new(dns.Msg)
+		response.SetReply(request)
+		switch question.Qtype {
+		case dns.TypeMX:
+			mxQueries.Add(1)
+			return
+		case dns.TypeTXT:
+			txtQueries.Add(1)
+			response.Answer = []dns.RR{&dns.TXT{
+				Hdr: dns.RR_Header{Name: question.Name, Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: 90},
+				Txt: []string{"after-timeout"},
+			}}
+			_ = writer.WriteMsg(response)
+		}
+	}))
+
+	options := dnsx.DefaultOptions
+	options.BaseResolvers = []string{"udp:" + resolver}
+	options.MaxRetries = 1
+	options.Timeout = 80 * time.Millisecond
+	client, err := dnsx.New(options)
+	if err != nil {
+		t.Fatalf("create DNS client: %v", err)
+	}
+
+	records, err := collectDNSRecords(
+		context.Background(),
+		client,
+		"isolated.example.test",
+		[]uint16{dns.TypeMX, dns.TypeTXT},
+		10*time.Millisecond,
+		2,
+	)
+	if err == nil || !strings.Contains(err.Error(), "MX query failed") {
+		t.Fatalf("expected an MX timeout, got %v", err)
+	}
+	if len(records) != 1 || records[0].Type != "TXT" || records[0].Value != `"after-timeout"` {
+		t.Fatalf("expected the TXT record after the MX timeout, got %v", records)
+	}
+
+	// Let the first client's blocked resolver call finish. Before client
+	// isolation, its next retry observed the shared TXT QuestionTypes mutation
+	// and issued a second TXT query after this function had reported the MX
+	// timeout.
+	time.Sleep(120 * time.Millisecond)
+	if mxQueries.Load() != 1 || txtQueries.Load() != 1 {
+		t.Fatalf("expected one isolated query per type, got MX=%d TXT=%d", mxQueries.Load(), txtQueries.Load())
 	}
 }
 
