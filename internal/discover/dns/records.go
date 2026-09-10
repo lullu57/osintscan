@@ -94,7 +94,7 @@ func filterDNSRecordsByType(records []*common.DnsRecord, recordTypes []common.Dn
 }
 
 // getDNSRecords queries DNS for the specified record types for a domain and returns a DnsRecords struct.
-// When timeoutSeconds > 0, the (blocking) resolver query is bounded by that wall-clock deadline.
+// When timeoutSeconds > 0, each record-type query gets that wall-clock deadline.
 func getDNSRecords(ctx context.Context, domain string, questionTypes []uint16, dnsResolvers []string, timeoutSeconds int) ([]*common.DnsRecord, error) {
 	log := svc1log.FromContext(ctx)
 
@@ -104,6 +104,14 @@ func getDNSRecords(ctx context.Context, domain string, questionTypes []uint16, d
 
 	options := dnsx.DefaultOptions
 	options.QuestionTypes = questionTypes
+	resolverAttempts := options.MaxRetries
+	// QueryOne treats a valid empty answer as a retryable miss. One library
+	// attempt lets queryDNSAnswers accept NODATA and NXDOMAIN immediately. The
+	// wrapper retains this retry count for transport and resolver failures.
+	options.MaxRetries = 1
+	if timeoutSeconds > 0 && time.Duration(timeoutSeconds)*time.Second < options.Timeout {
+		options.Timeout = time.Duration(timeoutSeconds) * time.Second
+	}
 	if len(dnsResolvers) > 0 {
 		options.BaseResolvers = dnsResolvers
 	}
@@ -115,48 +123,11 @@ func getDNSRecords(ctx context.Context, domain string, questionTypes []uint16, d
 		return []*common.DnsRecord{}, err
 	}
 
-	// dnsx exposes no timeout option, so bound the blocking query with a context
-	// deadline. The detached goroutine returns once the resolver's own retry budget
-	// is exhausted, so it cannot leak indefinitely.
+	queryTimeout := time.Duration(timeoutSeconds) * time.Second
 	if timeoutSeconds <= 0 {
-		return collectDNSRecords(ctx, client, domain, questionTypes)
+		queryTimeout = 0
 	}
-
-	queryCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSeconds)*time.Second)
-	defer cancel()
-
-	type recordsResult struct {
-		records []*common.DnsRecord
-		err     error
-	}
-	resultCh := make(chan recordsResult, 1)
-	go func() {
-		records, queryErr := collectDNSRecords(ctx, client, domain, questionTypes)
-		resultCh <- recordsResult{records: records, err: queryErr}
-	}()
-
-	select {
-	case <-queryCtx.Done():
-		// The resolver may have completed in the same scheduling window the
-		// context fired; prefer an already-available result over reporting a
-		// failure that didn't actually happen.
-		select {
-		case result := <-resultCh:
-			return result.records, result.err
-		default:
-		}
-		// Distinguish a parent-context cancellation (e.g. CLI interrupt) from an
-		// actual resolver timeout so the error isn't misattributed.
-		if errors.Is(queryCtx.Err(), context.Canceled) {
-			return []*common.DnsRecord{}, fmt.Errorf("DNS query for %s canceled: %w", domain, queryCtx.Err())
-		}
-		log.Warn("DNS query timed out",
-			svc1log.SafeParam("domain", domain),
-			svc1log.SafeParam("timeoutSeconds", timeoutSeconds))
-		return []*common.DnsRecord{}, fmt.Errorf("DNS query for %s timed out after %d seconds", domain, timeoutSeconds)
-	case result := <-resultCh:
-		return result.records, result.err
-	}
+	return collectDNSRecords(ctx, client, domain, questionTypes, queryTimeout, resolverAttempts)
 }
 
 func dnsRecordTypeFromRRType(rrType uint16) (common.DnsRecordType, bool) {
@@ -215,14 +186,13 @@ func dnsRecordsFromAnswers(answers []dns.RR, requestedType uint16) []*common.Dns
 // response into DnsRecord structs. QueryMultiple exposes only the final typed
 // response, so using it would force record-specific data back through lossy
 // convenience slices.
-func collectDNSRecords(ctx context.Context, client *dnsx.DNSX, domain string, questionTypes []uint16) ([]*common.DnsRecord, error) {
+func collectDNSRecords(ctx context.Context, client *dnsx.DNSX, domain string, questionTypes []uint16, queryTimeout time.Duration, resolverAttempts int) ([]*common.DnsRecord, error) {
 	log := svc1log.FromContext(ctx)
 
 	dnsRecords := []*common.DnsRecord{}
 	queryErrors := []error{}
 	for _, questionType := range questionTypes {
-		client.Options.QuestionTypes = []uint16{questionType}
-		results, err := client.QueryOne(domain)
+		answers, err := queryDNSAnswers(ctx, client, domain, questionType, queryTimeout, resolverAttempts)
 		if err != nil {
 			queryErr := fmt.Errorf("%s query failed: %w", dns.Type(questionType).String(), err)
 			queryErrors = append(queryErrors, queryErr)
@@ -230,12 +200,12 @@ func collectDNSRecords(ctx context.Context, client *dnsx.DNSX, domain string, qu
 				svc1log.SafeParam("domain", domain),
 				svc1log.SafeParam("record_type", dns.Type(questionType).String()),
 				svc1log.SafeParam("error", err.Error()))
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				break
+			}
 			continue
 		}
-		if results == nil || results.RawResp == nil {
-			continue
-		}
-		dnsRecords = append(dnsRecords, dnsRecordsFromAnswers(results.RawResp.Answer, questionType)...)
+		dnsRecords = append(dnsRecords, dnsRecordsFromAnswers(answers, questionType)...)
 	}
 
 	log.Debug("Processed DNS records",
@@ -243,6 +213,61 @@ func collectDNSRecords(ctx context.Context, client *dnsx.DNSX, domain string, qu
 		svc1log.SafeParam("total_records", len(dnsRecords)))
 
 	return dnsRecords, errors.Join(queryErrors...)
+}
+
+func queryDNSAnswers(ctx context.Context, client *dnsx.DNSX, domain string, questionType uint16, queryTimeout time.Duration, resolverAttempts int) ([]dns.RR, error) {
+	client.Options.QuestionTypes = []uint16{questionType}
+
+	query := func() ([]dns.RR, error) {
+		var lastErr error
+		for attempt := 0; attempt < resolverAttempts; attempt++ {
+			results, err := client.QueryOne(domain)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			if results == nil || results.RawResp == nil {
+				continue
+			}
+			switch results.RawResp.Rcode {
+			case dns.RcodeSuccess, dns.RcodeNameError:
+				return results.RawResp.Answer, nil
+			default:
+				lastErr = nil
+			}
+		}
+		return nil, lastErr
+	}
+	if queryTimeout <= 0 {
+		return query()
+	}
+
+	queryCtx, cancel := context.WithTimeout(ctx, queryTimeout)
+	defer cancel()
+	type queryResult struct {
+		answers []dns.RR
+		err     error
+	}
+	resultCh := make(chan queryResult, 1)
+	go func() {
+		answers, err := query()
+		resultCh <- queryResult{answers: answers, err: err}
+	}()
+
+	select {
+	case <-queryCtx.Done():
+		select {
+		case result := <-resultCh:
+			return result.answers, result.err
+		default:
+		}
+		if errors.Is(queryCtx.Err(), context.Canceled) {
+			return nil, fmt.Errorf("DNS query for %s canceled: %w", domain, queryCtx.Err())
+		}
+		return nil, fmt.Errorf("DNS query for %s timed out after %s: %w", domain, queryTimeout, queryCtx.Err())
+	case result := <-resultCh:
+		return result.answers, result.err
+	}
 }
 
 // DiscoverDomainDNSRecords queries DNS for all records for a given domain.

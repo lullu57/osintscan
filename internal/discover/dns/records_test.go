@@ -6,9 +6,11 @@ import (
 	"net"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/miekg/dns"
+	"github.com/projectdiscovery/dnsx/libs/dnsx"
 )
 
 func TestNormalizeDnsxResolversTrimsAndNormalizesAddresses(t *testing.T) {
@@ -91,14 +93,93 @@ func TestGetDNSRecordsPreservesTypedAnswersGolden(t *testing.T) {
 	}
 }
 
+func TestGetDNSRecordsDoesNotRetryValidEmptyAnswers(t *testing.T) {
+	var queryCount atomic.Int32
+	resolver := startDNSTestServer(t, dns.HandlerFunc(func(writer dns.ResponseWriter, request *dns.Msg) {
+		queryCount.Add(1)
+		response := new(dns.Msg)
+		response.SetReply(request)
+		response.Authoritative = true
+		_ = writer.WriteMsg(response)
+	}))
+
+	records, err := getDNSRecords(
+		context.Background(),
+		"empty.example.test",
+		[]uint16{dns.TypeA, dns.TypeMX},
+		[]string{"udp:" + resolver},
+		5,
+	)
+	if err != nil {
+		t.Fatalf("query valid empty answers: %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("expected no records, got %v", records)
+	}
+	if queryCount.Load() != 2 {
+		t.Fatalf("expected one query per record type, got %d", queryCount.Load())
+	}
+}
+
+func TestGetDNSRecordsRetainsRetriesForResolverFailures(t *testing.T) {
+	var queryCount atomic.Int32
+	resolver := startDNSTestServer(t, dns.HandlerFunc(func(writer dns.ResponseWriter, request *dns.Msg) {
+		queryCount.Add(1)
+		response := new(dns.Msg)
+		response.SetRcode(request, dns.RcodeServerFailure)
+		_ = writer.WriteMsg(response)
+	}))
+
+	records, err := getDNSRecords(
+		context.Background(),
+		"failure.example.test",
+		[]uint16{dns.TypeA},
+		[]string{"udp:" + resolver},
+		5,
+	)
+	if err != nil {
+		t.Fatalf("query resolver failures: %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("expected no records, got %v", records)
+	}
+	if queryCount.Load() != int32(dnsx.DefaultOptions.MaxRetries) {
+		t.Fatalf("expected %d resolver attempts, got %d", dnsx.DefaultOptions.MaxRetries, queryCount.Load())
+	}
+}
+
+func TestGetDNSRecordsKeepsEarlierRecordsWhenLaterTypeTimesOut(t *testing.T) {
+	resolver := startDNSTestServer(t, dns.HandlerFunc(func(writer dns.ResponseWriter, request *dns.Msg) {
+		if request.Question[0].Qtype != dns.TypeA {
+			return
+		}
+		response := new(dns.Msg)
+		response.SetReply(request)
+		response.Answer = []dns.RR{&dns.A{
+			Hdr: dns.RR_Header{Name: request.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
+			A:   net.ParseIP("192.0.2.25"),
+		}}
+		_ = writer.WriteMsg(response)
+	}))
+
+	records, err := getDNSRecords(
+		context.Background(),
+		"partial.example.test",
+		[]uint16{dns.TypeA, dns.TypeMX},
+		[]string{"udp:" + resolver},
+		1,
+	)
+	if err == nil || !strings.Contains(err.Error(), "MX query failed") || !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("expected an MX timeout, got %v", err)
+	}
+	if len(records) != 1 || records[0].Value != "192.0.2.25" {
+		t.Fatalf("expected the earlier A record to survive, got %v", records)
+	}
+}
+
 func startAuthoritativeDNSFixture(t *testing.T) string {
 	t.Helper()
-	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen for DNS fixture: %v", err)
-	}
-
-	handler := dns.HandlerFunc(func(writer dns.ResponseWriter, request *dns.Msg) {
+	return startDNSTestServer(t, dns.HandlerFunc(func(writer dns.ResponseWriter, request *dns.Msg) {
 		response := new(dns.Msg)
 		response.SetReply(request)
 		response.Authoritative = true
@@ -131,7 +212,15 @@ func startAuthoritativeDNSFixture(t *testing.T) string {
 			response.Answer = append(response.Answer, record)
 		}
 		_ = writer.WriteMsg(response)
-	})
+	}))
+}
+
+func startDNSTestServer(t *testing.T, handler dns.Handler) string {
+	t.Helper()
+	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen for DNS fixture: %v", err)
+	}
 
 	server := &dns.Server{PacketConn: packetConn, Handler: handler}
 	serveErrors := make(chan error, 1)
