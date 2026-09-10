@@ -3,6 +3,7 @@ package dns
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"reflect"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	dnsfern "github.com/Method-Security/osintscan/generated/go/discover/dns"
 	"github.com/miekg/dns"
 	"github.com/projectdiscovery/dnsx/libs/dnsx"
 )
@@ -91,6 +93,119 @@ func TestGetDNSRecordsPreservesTypedAnswersGolden(t *testing.T) {
 ]`
 	if string(actual) != expected {
 		t.Fatalf("DNS record golden mismatch\nexpected:\n%s\nactual:\n%s", expected, actual)
+	}
+}
+
+func TestDiscoverDomainDNSRecordsPreservesFullResultGolden(t *testing.T) {
+	resolver := startAuthoritativeDNSFixture(t)
+	useTCP := false
+	timeout := 5
+	report := DiscoverDomainDNSRecords(context.Background(), dnsfern.DiscoverDnsRecordsConfig{
+		Domain:       "example.test",
+		RecordTypes:  []string{"A", "MX", "SRV", "CAA", "TXT"},
+		DnsResolvers: []string{resolver},
+		UseTcp:       &useTCP,
+		Timeout:      &timeout,
+	})
+	if len(report.Errors) != 0 {
+		t.Fatalf("expected no report errors, got %v", report.Errors)
+	}
+	if report.Config == nil || report.Config.Domain != "example.test" {
+		t.Fatalf("expected the input config to be retained, got %#v", report.Config)
+	}
+
+	actual, err := json.MarshalIndent(report.Result, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal full DNS result: %v", err)
+	}
+	const expected = `{
+  "dnsRecords": [
+    {
+      "name": "example.test",
+      "ttl": 60,
+      "type": "A",
+      "value": "192.0.2.10"
+    },
+    {
+      "name": "example.test",
+      "ttl": 120,
+      "type": "A",
+      "value": "192.0.2.11"
+    },
+    {
+      "name": "example.test",
+      "ttl": 600,
+      "type": "CAA",
+      "value": "0 issue \"letsencrypt.org\""
+    },
+    {
+      "name": "example.test",
+      "ttl": 300,
+      "type": "MX",
+      "value": "10 mail.example.test."
+    },
+    {
+      "name": "_https._tcp.example.test",
+      "ttl": 45,
+      "type": "SRV",
+      "value": "5 20 443 service.example.test."
+    },
+    {
+      "name": "example.test",
+      "ttl": 90,
+      "type": "TXT",
+      "value": "\"segment-one\" \"segment-two\""
+    }
+  ],
+  "dmarcRecords": [
+    {
+      "name": "_dmarc.example.test",
+      "ttl": 90,
+      "type": "TXT",
+      "value": "\"segment-one\" \"segment-two\""
+    }
+  ],
+  "dkimRecords": [
+    {
+      "name": "default._domainkey.example.test",
+      "ttl": 90,
+      "type": "TXT",
+      "value": "\"segment-one\" \"segment-two\""
+    },
+    {
+      "name": "selector1._domainkey.example.test",
+      "ttl": 90,
+      "type": "TXT",
+      "value": "\"segment-one\" \"segment-two\""
+    },
+    {
+      "name": "selector2._domainkey.example.test",
+      "ttl": 90,
+      "type": "TXT",
+      "value": "\"segment-one\" \"segment-two\""
+    },
+    {
+      "name": "google._domainkey.example.test",
+      "ttl": 90,
+      "type": "TXT",
+      "value": "\"segment-one\" \"segment-two\""
+    },
+    {
+      "name": "amazonses._domainkey.example.test",
+      "ttl": 90,
+      "type": "TXT",
+      "value": "\"segment-one\" \"segment-two\""
+    },
+    {
+      "name": "microsoft._domainkey.example.test",
+      "ttl": 90,
+      "type": "TXT",
+      "value": "\"segment-one\" \"segment-two\""
+    }
+  ]
+}`
+	if string(actual) != expected {
+		t.Fatalf("full DNS result golden mismatch\nexpected:\n%s\nactual:\n%s", expected, actual)
 	}
 }
 
@@ -266,7 +381,7 @@ func startAuthoritativeDNSFixture(t *testing.T) string {
 		case dns.TypeCAA:
 			recordStrings = []string{`example.test. 600 IN CAA 0 issue "letsencrypt.org"`}
 		case dns.TypeTXT:
-			recordStrings = []string{`example.test. 90 IN TXT "segment-one" "segment-two"`}
+			recordStrings = []string{fmt.Sprintf(`%s 90 IN TXT "segment-one" "segment-two"`, request.Question[0].Name)}
 		}
 		for _, value := range recordStrings {
 			record, parseErr := dns.NewRR(value)
