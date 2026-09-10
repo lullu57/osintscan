@@ -200,7 +200,9 @@ func collectDNSRecords(ctx context.Context, client *dnsx.DNSX, domain string, qu
 				svc1log.SafeParam("domain", domain),
 				svc1log.SafeParam("record_type", dns.Type(questionType).String()),
 				svc1log.SafeParam("error", err.Error()))
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			// A per-type deadline should not prevent later record types from being
+			// queried. Stop only when the caller's parent context is canceled.
+			if ctx.Err() != nil {
 				break
 			}
 			continue

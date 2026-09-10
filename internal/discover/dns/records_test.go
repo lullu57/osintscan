@@ -148,32 +148,41 @@ func TestGetDNSRecordsRetainsRetriesForResolverFailures(t *testing.T) {
 	}
 }
 
-func TestGetDNSRecordsKeepsEarlierRecordsWhenLaterTypeTimesOut(t *testing.T) {
+func TestGetDNSRecordsKeepsRecordsAndContinuesAfterTypeTimeout(t *testing.T) {
 	resolver := startDNSTestServer(t, dns.HandlerFunc(func(writer dns.ResponseWriter, request *dns.Msg) {
-		if request.Question[0].Qtype != dns.TypeA {
+		question := request.Question[0]
+		if question.Qtype == dns.TypeMX {
 			return
 		}
 		response := new(dns.Msg)
 		response.SetReply(request)
-		response.Answer = []dns.RR{&dns.A{
-			Hdr: dns.RR_Header{Name: request.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
-			A:   net.ParseIP("192.0.2.25"),
-		}}
+		switch question.Qtype {
+		case dns.TypeA:
+			response.Answer = []dns.RR{&dns.A{
+				Hdr: dns.RR_Header{Name: question.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
+				A:   net.ParseIP("192.0.2.25"),
+			}}
+		case dns.TypeTXT:
+			response.Answer = []dns.RR{&dns.TXT{
+				Hdr: dns.RR_Header{Name: question.Name, Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: 90},
+				Txt: []string{"after-timeout"},
+			}}
+		}
 		_ = writer.WriteMsg(response)
 	}))
 
 	records, err := getDNSRecords(
 		context.Background(),
 		"partial.example.test",
-		[]uint16{dns.TypeA, dns.TypeMX},
+		[]uint16{dns.TypeA, dns.TypeMX, dns.TypeTXT},
 		[]string{"udp:" + resolver},
 		1,
 	)
 	if err == nil || !strings.Contains(err.Error(), "MX query failed") || !strings.Contains(err.Error(), "timed out") {
 		t.Fatalf("expected an MX timeout, got %v", err)
 	}
-	if len(records) != 1 || records[0].Value != "192.0.2.25" {
-		t.Fatalf("expected the earlier A record to survive, got %v", records)
+	if len(records) != 2 || records[0].Value != "192.0.2.25" || records[1].Value != `"after-timeout"` {
+		t.Fatalf("expected records before and after the MX timeout, got %v", records)
 	}
 }
 
